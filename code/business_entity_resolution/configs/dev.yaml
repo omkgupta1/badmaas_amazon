@@ -1,0 +1,28 @@
+# Dev slice (~5% of the data, cut by city; build it with `python -m src.run_pipeline dev-slice`).
+# Same pipeline, smaller chunks and fewer boosting rounds so an end-to-end run takes minutes.
+
+paths:
+  data_dir: ../../work/dev_data
+  work_dir: ../../work/dev
+  out_dir: ../../work/dev/output
+
+prep:
+  chunk_size: 20000
+  address_lexicon:
+    state_min_s1_count: 5
+    state_min_count: 5
+    abbr_min_count: 10
+
+blocking:
+  query_chunk: 100000
+  fit_sample_queries: 300000
+  prerank:
+    train_query_frac: 0.5
+    num_boost_round: 200
+
+model:
+  sample:
+    max_rows: 3000000
+  num_boost_round: 1500
+  early_stopping_rounds: 80
+  aux_rounds: 500

@@ -1,0 +1,114 @@
+# Business Entity Resolution — default configuration (full data, Apple M5 / 16 GB RAM).
+# Relative paths are resolved against code/business_entity_resolution/.
+# Override any key from the CLI:  python -m src.run_pipeline ... -o blocking.name_view.k=15
+
+paths:
+  data_dir: ../../dataset          # contains train/ and test/
+  work_dir: ../../work             # caches (parquet, models, reports) — safe to delete
+  out_dir: ../../output            # matching_results.tsv + candidate_pairs.tsv
+  validator: ../../utils/validate_submission.py
+
+runtime:
+  seed: 42
+  n_workers: 8                     # processes for Python-level parsing (prep)
+  n_threads: 10                    # threads for rapidfuzz / sparse top-k / LightGBM
+
+prep:
+  chunk_size: 100000               # records per multiprocessing task
+  indic_lexicon:                   # native-script token -> Latin token, mined from train positives
+    min_count: 3
+    min_share: 0.5
+    min_sim: 0.55
+  address_lexicon:                 # state synonyms + abbreviations, mined from GT + pseudo-pairs
+    state_min_s1_count: 30         # a component is an S1 "state" if it ends >= this many S1 addresses
+    state_min_count: 20
+    state_min_share: 0.8
+    abbr_min_count: 50
+    abbr_min_share: 0.6
+    max_pseudo_pairs: 3000000
+
+blocking:
+  query_chunk: 300000              # queries (S2/S3 records) per sparse top-k chunk
+  fit_sample_queries: 2000000      # S2/S3 docs added to S1 docs when fitting TF-IDF (per country)
+  name_view: {k: 10, ngram: 3, min_df: 2, max_df: 0.05}
+  addr_view: {k: 10, min_df: 2, max_df: 0.05}
+  joint_view: {k: 15, name_weight: 0.5}
+  reverse_k: 5                     # S1 -> S2/S3 top-k on the joint view (0 disables)
+  key_name_cap: 10                 # exact sorted-core-name key, max S1 group size
+  key_addr_cap: 10                 # exact house-number + street key, max S1 group size
+  keep_union: false                # keep the pre-cut union parts (debugging only)
+  prerank:
+    train_query_frac: 0.15         # fraction of queries sampled to train each cross-fitted booster
+    eval_query_frac: 0.05          # out-of-sample queries used to pick M
+    max_train_rows: 12000000       # per booster (negatives are thinned to fit)
+    num_boost_round: 400
+    min_m: 4
+    max_m: 12
+    max_recall_loss: 0.001         # allowed (out-of-sample) loss of union recall when cutting to top-M;
+                                   # each extra candidate per query costs ~15% more feature/model time
+
+features:
+  consensus_top_rank: 3            # group-similarity features only for pairs ranked <= this per query
+  group_sim_cap: 200               # at most this many G_s members compared per pair
+
+model:
+  n_folds: 3
+  sample:                          # training-row sampling (inverse-probability weighted)
+    pos_frac: 0.6
+    hard_neg_frac: 0.35
+    easy_neg_frac: 0.06
+    hard_rank: 3
+    max_rows: 14000000
+  valid_s1_frac: 0.08              # training-fold S1s held out for early stopping
+  num_boost_round: 5000
+  early_stopping_rounds: 150
+  lgb:
+    objective: binary
+    learning_rate: 0.05
+    num_leaves: 255
+    min_data_in_leaf: 200
+    feature_fraction: 0.75
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    lambda_l2: 2.0
+    max_bin: 127
+    min_data_in_bin: 5
+    force_row_wise: true
+    deterministic: true
+    verbose: -1
+  aux_lgb:                         # orphan + singleton models
+    objective: binary
+    learning_rate: 0.05
+    num_leaves: 63
+    min_data_in_leaf: 100
+    feature_fraction: 0.9
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    verbose: -1
+  aux_rounds: 1500
+
+decision:
+  prior_shift: false               # EM re-estimation of the pair prior on test (check report first)
+  floor: 0.02                      # ignore assignments below this probability
+  margins: [0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+  taus: [0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]
+  mhat: [0.0, 0.1, 0.25, 0.5, 1.0]
+  item_floors: [0.0, 0.1, 0.2, 0.3]
+
+neural:                            # optional cross-encoder (runs on mps / cuda / cpu)
+  enabled: false
+  model_name: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  max_len: 96
+  batch_size: 64
+  infer_batch_size: 256
+  lr: 3.0e-5
+  epochs: 1
+  warmup_frac: 0.05
+  train_pairs_per_half: 1200000
+  band_low: 0.02
+  band_high: 0.98
+  top_per_query: 3
+  device: auto
+
+report:
+  n_examples: 40

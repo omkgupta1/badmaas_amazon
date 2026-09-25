@@ -1,0 +1,14 @@
+# Exact versions used to produce the submitted outputs.
+# Python 3.12.14 (uv venv --python 3.12), macOS arm64 (Apple M5, 16 GB); also runs on Linux x86-64.
+polars==1.44.2
+pyarrow==25.0.1
+numpy==2.5.3
+scipy==1.18.1
+scikit-learn==1.9.1
+rapidfuzz==3.14.6
+jellyfish==1.2.1
+sparse_dot_topn==1.2.0
+lightgbm==4.7.0
+pyyaml==6.0.3
+psutil==7.2.2
+pytest==9.1.1

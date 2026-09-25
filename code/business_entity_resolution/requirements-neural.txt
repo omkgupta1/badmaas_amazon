@@ -1,0 +1,3 @@
+# Optional cross-encoder (neural.enabled: true). Works on Apple MPS, CUDA or CPU.
+torch>=2.3
+transformers>=4.44

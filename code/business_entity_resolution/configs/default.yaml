@@ -30,10 +30,17 @@ prep:
 blocking:
   query_chunk: 300000              # queries (S2/S3 records) per sparse top-k chunk
   fit_sample_queries: 2000000      # S2/S3 docs added to S1 docs when fitting TF-IDF (per country)
-  name_view: {k: 10, ngram: 3, min_df: 2, max_df: 0.05}
-  addr_view: {k: 10, min_df: 2, max_df: 0.05}
-  joint_view: {k: 15, name_weight: 0.5}
+  name_view: {k: 15, ngram: 3, min_df: 2, max_df: 0.05}
+  addr_view: {k: 15, min_df: 2, max_df: 0.05}
+  joint_view: {k: 20, name_weight: 0.5}
   reverse_k: 5                     # S1 -> S2/S3 top-k on the joint view (0 disables)
+  partition:                       # search within the query's state group (~10x faster, less crowding)
+    enabled: true
+    min_merge_pairs: 200           # merge two states linked by >= this many true train pairs ...
+    min_merge_share: 0.01          # ... that are >= this share of the query state's true pairs
+    merge: {}                      # explicit merges, e.g. {India: [[andhra pradesh, telangana]]}
+  rare_name_view: {k: 5, max_df: 0.0002}   # country-wide rare name words (cross-state safety net)
+  bench_chunks: 1                  # `block-bench`: query chunks per country
   key_name_cap: 10                 # exact sorted-core-name key, max S1 group size
   key_addr_cap: 10                 # exact house-number + street key, max S1 group size
   keep_union: false                # keep the pre-cut union parts (debugging only)
@@ -46,6 +53,26 @@ blocking:
     max_m: 12
     max_recall_loss: 0.001         # allowed (out-of-sample) loss of union recall when cutting to top-M;
                                    # each extra candidate per query costs ~15% more feature/model time
+
+augment:                           # synthetic decoy groups in train (test decoys come as record groups)
+  enabled: true                    # rates: test shows +0.35 (US) / +0.11 (India) decoy-like records per S1
+  decoy_copies:                    # copy of a train decoy (same shifted number), same or other source
+    min_name_ratio: 80             # eligible: orphan whose top stage-0 candidate has name_ratio0 >= this
+    rate: {US: 0.10, India: 0.10}  # share of eligible decoys copied (US +0.07, India +0.03 per S1)
+    default_rate: 0.10
+  true_twins:                      # group of records named like the S1's true records, at hn + delta
+    rate: {US: 0.14, India: 0.04}  # share of S1s that get a group (US +0.28, India +0.08 per S1)
+    default_rate: 0.08
+    group_size: 2
+    cross_source: 0.5              # chance a copy switches source (S2 <-> S3)
+    shift_buckets: [[1, 1, 0.1], [2, 9, 0.6], [10, 99, 0.3]]   # |delta| profile seen on test
+  same_source_frac: 0.5            # decoy copies: stay in the decoy's source (else S2 <-> S3)
+  name_noise: 0.6                  # chance of one light name edit on a copy
+  s2_address_upper: {US: 0.9, India: 0.25, default: 0.5}
+
+probe:                             # `probe`: cached decision minus the decoy-twin signature
+  max_shift: 99
+  cross_source_only: false
 
 features:
   consensus_top_rank: 3            # group-similarity features only for pairs ranked <= this per query
@@ -62,6 +89,9 @@ model:
   valid_s1_frac: 0.08              # training-fold S1s held out for early stopping
   num_boost_round: 5000
   early_stopping_rounds: 150
+  nan_augment:                     # training rows only: blank these on this share of non-empty
+    cols: [state_eq]               # addresses (test France: 33% have no mapped state, train: 0%)
+    frac: 0.35
   lgb:
     objective: binary
     learning_rate: 0.05

@@ -120,6 +120,22 @@ def _matrix(dirs, cmap, cols, plan, keep_fn) -> tuple[np.ndarray, np.ndarray, np
     return X, y, w
 
 
+def nan_augment(X: np.ndarray, cols: list[str], cfg: dict, seed: int) -> None:
+    """In place, training rows only: blank ``model.nan_augment.cols`` on a random share of rows
+    whose address is not empty. In train a missing state only happens with an empty address (a
+    97.7% match rate), while 33% of test-France queries with an address have no mapped state; this
+    keeps the model from reading "no state" as "empty address"."""
+    na = cfg["model"].get("nan_augment") or {}
+    frac = float(na.get("frac", 0.0))
+    names = [c for c in na.get("cols", []) if c in cols]
+    if frac <= 0 or not names or len(X) == 0:
+        return
+    ok = X[:, cols.index("b_addr_empty")] == 0 if "b_addr_empty" in cols else np.ones(len(X), bool)
+    m = ok & (np.random.default_rng(seed).random(len(X)) < frac)
+    for c in names:
+        X[m, cols.index(c)] = np.nan
+
+
 def lgb_params(cfg: dict, key: str = "lgb") -> dict:
     p = dict(cfg["model"][key])
     p["num_threads"] = int(cfg["runtime"]["n_threads"])
@@ -145,11 +161,13 @@ def train_stage(cfg: dict, stage_name: str, exclude: set[str] | None = None,
     for k in range(n_folds):
         with stage(f"train[{tag}] fold {k}", rep):
             Xt, yt, wt = _matrix(dirs, cmap, cols, plan, lambda pp: (pp["fold"] != k) & ~pp["es"])
+            nan_augment(Xt, cols, cfg, 1000 + k)
             dtrain = lgb.Dataset(Xt, yt, weight=wt, feature_name=cols, free_raw_data=True,
                                  params=params)
             dtrain.construct()
             del Xt, yt, wt
             Xv, yv, wv = _matrix(dirs, cmap, cols, plan, lambda pp: (pp["fold"] != k) & pp["es"])
+            nan_augment(Xv, cols, cfg, 2000 + k)
             dvalid = lgb.Dataset(Xv, yv, weight=wv, reference=dtrain, free_raw_data=True)
             booster = lgb.train(
                 params, dtrain, num_boost_round=int(cfg["model"]["num_boost_round"]),

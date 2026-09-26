@@ -23,7 +23,7 @@ from rapidfuzz import fuzz, process
 from .config import models_dir, report_dir, split_dir
 from .context_features import _HN_SCALE
 from .records import load_records, load_truth
-from .train_gbdt import lgb_params, s1_valid_mask
+from .train_gbdt import lgb_params, nan_augment, s1_valid_mask
 from .utils import (LOG, is_done, list_parts, load_json, mark_done, part_path, reset_dir,
                     save_json, stage, write_df)
 
@@ -31,11 +31,14 @@ ORPHAN_FEATS = {
     "feat": ["n_tset", "n_core_ratio", "ad_tset", "hn_eq", "hn_logdiff", "hn_single_sub",
              "hn_substr", "b_addr_empty", "b_is_domain", "b_has_alias", "b_name_script", "b_src",
              "n_extra_b_cnt", "n_extra_b_maxidf", "a_name_family", "b_name_amb", "st_ratio",
-             "city_eq", "state_eq", "n_idf_jacc", "ad_idf_jacc"],
+             "city_eq", "state_eq", "n_idf_jacc", "ad_idf_jacc", "fmt_n_upper", "fmt_a_upper",
+             "fmt_n_accent", "fmt_n_leet", "fmt_n_junk", "fmt_n_idnum", "fmt_n_noise",
+             "fmt_a_hashhash", "fmt_a_zeropad"],
     "ctx": ["g_n", "g_hn_a", "g_hn_b", "g_hn_b_x", "g_hn_a_src", "g_name_max", "g_addr_max",
-            "q_ncand", "q_n_hn_eq"],
+            "q_ncand", "q_n_hn_eq", "g_n_hn", "g_hn_b_is_max", "g_hn_a_is_max", "g_hn_ba_diff"],
     "coll": ["q_pa_max_other", "q_pa_margin", "q_pa_sum", "s_pa_sum_other", "s_pa_max_other",
-             "psup_a", "psup_b", "conf_name", "conf_addr", "conf_hn_eq", "pa"],
+             "psup_a", "psup_b", "psup_ba_diff", "s_pa_sum_other_src", "s_n50_other_src",
+             "conf_name", "conf_addr", "conf_hn_eq", "pa"],
 }
 
 
@@ -114,6 +117,8 @@ def collective_features(s: np.ndarray, q: np.ndarray, pa: np.ndarray, q_hn: np.n
         f["psup_b"] = psup_b.astype(np.float32)
         f["psup_a_share"] = np.where(denom > 1e-6, psup_a / denom, np.nan).astype(np.float32)
         f["psup_b_share"] = np.where(denom > 1e-6, psup_b / denom, np.nan).astype(np.float32)
+        # decoy twins: q's number is backed, but less than the S1's own number
+        f["psup_ba_diff"] = (psup_b - psup_a).astype(np.float32)
     # ---- similarity to s's most confident other record
     has = conf_q >= 0
     conf_name = np.full(len(q), np.nan, dtype=np.float32)
@@ -238,8 +243,11 @@ def orphan_model(cfg: dict, split: str, n_q: int) -> np.ndarray:
         for k in range(n_folds):
             trn = (fold != k) & ~es
             val = (fold != k) & es
-            dtr = lgb.Dataset(X[trn], y[trn], feature_name=cols, params=params)
-            dva = lgb.Dataset(X[val], y[val], reference=dtr)
+            Xt, Xv = X[trn], X[val]            # copies; OOF rows keep their real values
+            nan_augment(Xt, cols, cfg, 3000 + k)
+            nan_augment(Xv, cols, cfg, 4000 + k)
+            dtr = lgb.Dataset(Xt, y[trn], feature_name=cols, params=params)
+            dva = lgb.Dataset(Xv, y[val], reference=dtr)
             b = lgb.train(params, dtr, num_boost_round=int(cfg["model"]["aux_rounds"]),
                           valid_sets=[dva], callbacks=[lgb.early_stopping(50, verbose=False)])
             b.save_model(str(mdir / f"orphan_fold{k}.txt"), num_iteration=b.best_iteration)

@@ -34,8 +34,11 @@ class Ranker:
         return self.boosters[(1 - part % 2) % len(self.boosters)]
 
     def score(self, df: pl.DataFrame, part: int) -> np.ndarray:
-        X = df.select([pl.col(c).cast(pl.Float32) for c in UNION_FEATURES]).to_numpy()
-        return self.booster_for(part).predict(X, num_threads=self.n_threads).astype(np.float32)
+        booster = self.booster_for(part)
+        # the booster's own feature list (a ranker trained before a union feature was added
+        # still scores the candidate parts it was trained with)
+        X = df.select([pl.col(c).cast(pl.Float32) for c in booster.feature_name()]).to_numpy()
+        return booster.predict(X, num_threads=self.n_threads).astype(np.float32)
 
 
 def cut_top_m(ranker: Ranker, df: pl.DataFrame, part: int) -> pl.DataFrame:

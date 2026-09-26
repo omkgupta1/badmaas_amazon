@@ -27,14 +27,15 @@ from .records import load_records, load_truth
 from .utils import (LOG, chunks, is_done, list_parts, load_json, mark_done, part_path,
                     reset_dir, save_json, stage, write_df)
 
-FLAG_N, FLAG_A, FLAG_NA, FLAG_KN, FLAG_KA, FLAG_REV = 1, 2, 4, 8, 16, 32
+FLAG_N, FLAG_A, FLAG_NA, FLAG_KN, FLAG_KA, FLAG_REV, FLAG_RN = 1, 2, 4, 8, 16, 32, 64
 UNION_FEATURES = [
     "cos_n", "cos_a", "cos_na", "r_n", "r_a", "r_na", "in_n", "in_a", "in_na", "key_name",
     "key_addr", "rev", "hn_eq0", "name_ratio0", "addr_tset0", "n_union", "b_addr_empty0",
-    "b_is_domain0",
+    "b_is_domain0", "in_rn",
 ]
 _REC_COLS = ["country", "name_concat", "addr_block", "name_sorted", "hn", "street", "name_norm",
-             "addr_norm", "addr_empty", "is_domain"]
+             "addr_norm", "addr_empty", "is_domain", "state", "name_core"]
+STATE_GROUPS_FILE = "state_groups.json"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -102,8 +103,20 @@ class CountryViews:
     """TF-IDF vectorisers and S1 matrices of one country."""
 
     def __init__(self, cfg: dict, s_name: list[str], s_addr: list[str], q_name_fit: list[str],
-                 q_addr_fit: list[str]):
+                 q_addr_fit: list[str], s_words: list[str] | None = None,
+                 q_words_fit: list[str] | None = None):
         b = cfg["blocking"]
+        # country-wide view over RARE name words (cheap: short posting lists); it keeps
+        # cross-state matches with a distinctive name when retrieval is split by state
+        rv = b.get("rare_name_view", {})
+        self.rare_vec, self.S_R_T = None, None
+        if s_words is not None and int(rv.get("k", 0)) > 0:
+            self.rare_vec = TfidfVectorizer(analyzer=str.split, lowercase=False, min_df=2,
+                                            max_df=float(rv["max_df"]), sublinear_tf=True,
+                                            dtype=np.float32)
+            self.rare_vec.fit(s_words + (q_words_fit or []))
+            self.rare_vec.stop_words_ = None
+            self.S_R_T = self.rare_vec.transform(s_words).T.tocsr()
         nv, av = b["name_view"], b["addr_view"]
         self.w = float(b["joint_view"]["name_weight"])
         n_fit = len(s_name) + len(q_name_fit)
@@ -135,6 +148,113 @@ class CountryViews:
 
 def _name_docs(names: list[str]) -> list[str]:
     return [f" {n} " if n else "" for n in names]
+
+
+class Partition:
+    """S1 columns of one country split by state group. A query whose state belongs to a group
+    searches only that group's S1 records; a query without a (known) state searches the whole
+    country. With ~25-45 groups this cuts the sparse top-k cost ~10x and removes the crowding of
+    true matches by same-name / same-street S1 records of other states."""
+
+    def __init__(self, s_group: np.ndarray, views: CountryViews):
+        self.cols = {int(g): np.flatnonzero(s_group == g) for g in np.unique(s_group) if g >= 0}
+        mats = (views.S_N, views.S_A, views.S_NA)
+        self.T = {g: tuple(M[c].T.tocsr() for M in mats) for g, c in self.cols.items()}
+        self.S_NA = {g: views.S_NA[c] for g, c in self.cols.items()}
+        self.full_T = (views.S_N_T, views.S_A_T, views.S_NA_T)
+
+    def rows_by_group(self, q_group: np.ndarray) -> dict[int, np.ndarray]:
+        """Chunk rows per group; key -1 = rows searched against the whole country."""
+        known = np.isin(q_group, np.fromiter(self.cols, dtype=np.int64))
+        out = {-1: np.flatnonzero(~known)}
+        order = np.argsort(q_group, kind="stable")
+        g_sorted = q_group[order]
+        for g in self.cols:
+            lo, hi = np.searchsorted(g_sorted, g, "left"), np.searchsorted(g_sorted, g, "right")
+            if hi > lo:
+                out[g] = np.sort(order[lo:hi])
+        return out
+
+    def topn(self, M: sp.csr_matrix, vi: int, by_group: dict[int, np.ndarray], k: int,
+             nt: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        rows, cols, vals = [], [], []
+        for g, r in by_group.items():
+            if len(r) == 0:
+                continue
+            B = self.full_T[vi] if g < 0 else self.T[g][vi]
+            C = _topn(M[r], B, k, nt)
+            rows.append(r[C.row])
+            cols.append(C.col if g < 0 else self.cols[g][C.col])
+            vals.append(C.data)
+        if not rows:
+            return np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.float32)
+        return np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
+
+    def reverse(self, Q_NA: sp.csr_matrix, by_group: dict[int, np.ndarray], k: int,
+                nt: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Each S1 keeps its k best queries of its own group (S1 column idx, chunk row, value)."""
+        s_loc, q_loc, vals = [], [], []
+        for g, r in by_group.items():
+            if g < 0 or len(r) == 0:
+                continue
+            R = _topn(self.S_NA[g], Q_NA[r].T.tocsr(), k, nt)
+            s_loc.append(self.cols[g][R.row])
+            q_loc.append(r[R.col])
+            vals.append(R.data)
+        if not s_loc:
+            return np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.float32)
+        return np.concatenate(s_loc), np.concatenate(q_loc), np.concatenate(vals)
+
+
+def state_group_maps(cfg: dict, split: str, s1: pl.DataFrame, q: pl.DataFrame,
+                     q_true: np.ndarray | None) -> dict[str, dict[str, int]]:
+    """Per country: S1 state -> group id. Confusable states are merged: on train, two states are
+    linked when >= min_merge_pairs true pairs (and >= min_merge_share of the query state's true
+    pairs) connect them (e.g. Andhra Pradesh records of Telangana businesses); the merges are
+    saved for test. Explicit merges can be added in config (blocking.partition.merge)."""
+    pc = cfg["blocking"].get("partition", {})
+    path = models_dir(cfg) / STATE_GROUPS_FILE
+    s_state, s_c = s1["state"].to_numpy(), s1["country"].to_numpy()
+    merges: dict[str, list[list[str]]] = {c: [list(m) for m in v]
+                                          for c, v in (pc.get("merge") or {}).items()}
+    if split == "train" and q_true is not None:
+        pos = np.flatnonzero(q_true >= 0)
+        d = pl.DataFrame({"c": s_c[q_true[pos]], "a": q["state"].to_numpy()[pos],
+                          "b": s_state[q_true[pos]]}).filter(pl.col("a") != "")
+        tot = d.group_by(["c", "a"]).agg(pl.len().alias("tot"))
+        links = (d.filter((pl.col("b") != "") & (pl.col("a") != pl.col("b")))
+                 .group_by(["c", "a", "b"]).agg(pl.len().alias("n")).join(tot, on=["c", "a"])
+                 .filter((pl.col("n") >= int(pc.get("min_merge_pairs", 200)))
+                         & (pl.col("n") / pl.col("tot") >= float(pc.get("min_merge_share", 0.01)))))
+        for c, a, b, n, t in links.iter_rows():
+            merges.setdefault(c, []).append([a, b])
+            LOG.info("  state merge [%s]: %s <-> %s (%d true pairs, %.1f%%)", c, a, b, n, 100 * n / t)
+        save_json(merges, path)
+    elif path.exists():
+        merges = load_json(path)
+    out: dict[str, dict[str, int]] = {}
+    for c in sorted(set(s_c.tolist())):
+        states = sorted(set(s_state[s_c == c].tolist()) - {""})
+        parent = {st: st for st in states}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for grp in merges.get(c, []):
+            members = [m for m in grp if m in parent]
+            for m in members[1:]:
+                parent[find(m)] = find(members[0])
+        roots = sorted({find(st) for st in states})
+        rid = {r: i for i, r in enumerate(roots)}
+        out[c] = {st: rid[find(st)] for st in states}
+    return out
+
+
+def _group_codes(states: np.ndarray, gmap: dict[str, int]) -> np.ndarray:
+    return np.array([gmap.get(st, -1) for st in states.tolist()], dtype=np.int64)
 
 
 def _key_pairs(s1c: pl.DataFrame, qc: pl.DataFrame, key: pl.Expr, cap: int) -> pl.DataFrame:
@@ -176,22 +296,35 @@ def _nan_empty(vals: np.ndarray, a: pl.Series, b: pl.Series) -> np.ndarray:
 
 
 def union_features(qc_ids: np.ndarray, s_ids: np.ndarray, views: CountryViews, Q, extra,
-                   s1: pl.DataFrame, q: pl.DataFrame, n_s1_total: int, cfg: dict) -> pl.DataFrame:
+                   s1: pl.DataFrame, q: pl.DataFrame, n_s1_total: int, cfg: dict,
+                   part: Partition | None = None, by_group: dict | None = None) -> pl.DataFrame:
     """Union of all candidate sources for one query chunk + cheap stage-0 features."""
     b = cfg["blocking"]
     nt = int(cfg["runtime"]["n_threads"])
     Q_N, Q_A, Q_NA = Q
     qs, ss, fs = [extra[0]], [extra[1]], [extra[2]]
-    for M, B, k, flag in ((Q_N, views.S_N_T, b["name_view"]["k"], FLAG_N),
-                          (Q_A, views.S_A_T, b["addr_view"]["k"], FLAG_A),
-                          (Q_NA, views.S_NA_T, b["joint_view"]["k"], FLAG_NA)):
+    full_T = (views.S_N_T, views.S_A_T, views.S_NA_T)
+    for vi, (M, k, flag) in enumerate(((Q_N, b["name_view"]["k"], FLAG_N),
+                                       (Q_A, b["addr_view"]["k"], FLAG_A),
+                                       (Q_NA, b["joint_view"]["k"], FLAG_NA))):
         if k <= 0:
             continue
-        C = _topn(M, B, int(k), nt)
+        if part is None:
+            C = _topn(M, full_T[vi], int(k), nt)
+            rows, cols, vals = C.row, C.col, C.data
+        else:
+            rows, cols, vals = part.topn(M, vi, by_group, int(k), nt)
+        keep = vals > 0
+        qs.append(qc_ids[rows[keep]])
+        ss.append(s_ids[cols[keep]])
+        fs.append(np.full(int(keep.sum()), flag, dtype=np.int16))
+    if views.rare_vec is not None:  # country-wide rare-name-word view
+        R = views.rare_vec.transform(q["name_core"].gather(qc_ids).to_list()).tocsr()
+        C = _topn(R, views.S_R_T, int(b["rare_name_view"]["k"]), nt)
         keep = C.data > 0
         qs.append(qc_ids[C.row[keep]])
         ss.append(s_ids[C.col[keep]])
-        fs.append(np.full(int(keep.sum()), flag, dtype=np.int16))
+        fs.append(np.full(int(keep.sum()), FLAG_RN, dtype=np.int16))
     qa = np.concatenate(qs).astype(np.int64)
     sa = np.concatenate(ss).astype(np.int64)
     fa = np.concatenate(fs).astype(np.int16)
@@ -228,6 +361,7 @@ def union_features(qc_ids: np.ndarray, s_ids: np.ndarray, views: CountryViews, Q
         "key_name": ((flags & FLAG_KN) > 0).astype(np.float32),
         "key_addr": ((flags & FLAG_KA) > 0).astype(np.float32),
         "rev": ((flags & FLAG_REV) > 0).astype(np.float32),
+        "in_rn": ((flags & FLAG_RN) > 0).astype(np.float32),
         "hn_eq0": hn_eq, "name_ratio0": name_ratio, "addr_tset0": addr_tset,
         "n_union": n_union,
         "b_addr_empty0": q["addr_empty"].gather(q_u).cast(pl.Float32).to_numpy(),
@@ -257,6 +391,10 @@ def run_blocking(cfg: dict, split: str, resume: bool = False) -> None:
         if ranker is None:
             raise FileNotFoundError("stage-0 ranker missing — run `block --split train` first")
     target = cand_dir if ranker is not None else out / "union"
+    if split == "train":
+        from .augment import strip_synthetic
+
+        strip_synthetic(cfg)  # synthetic twins are added after blocking, never blocked
     if not (resume and target.exists()):
         reset_dir(target)
     with stage(f"blocking[{split}] retrieve", rep):
@@ -298,7 +436,9 @@ def _existing_parts(target: Path, q_country: np.ndarray) -> tuple[dict[str, list
     return first_q, len(parts), n_rows
 
 
-def _retrieve(cfg: dict, split: str, target: Path, ranker, resume: bool = False) -> None:
+def _retrieve(cfg: dict, split: str, target: Path, ranker, resume: bool = False,
+              max_chunks: int | None = None) -> None:
+    """``max_chunks``: only the first chunks of each country (``block-bench``)."""
     from .prerank import cut_top_m
 
     b = cfg["blocking"]
@@ -316,6 +456,9 @@ def _retrieve(cfg: dict, split: str, target: Path, ranker, resume: bool = False)
         LOG.info("resume: %d parts (%d rows) already written", part_i, offset)
     size = int(b["query_chunk"])
     tmp = split_dir(cfg, split) / "_tmp_block"
+    use_part = bool(b.get("partition", {}).get("enabled", False))
+    gmaps = state_group_maps(cfg, split, s1, q, q_true) if use_part else {}
+    use_rare = int(b.get("rare_name_view", {}).get("k", 0)) > 0
     for country in countries:
         t0 = time.perf_counter()
         s_ids = np.flatnonzero(s_country == country).astype(np.int64)
@@ -326,7 +469,7 @@ def _retrieve(cfg: dict, split: str, target: Path, ranker, resume: bool = False)
         # drawn for every country (also when resume skips it) so later countries get the same draw
         fit_ids = q_ids if len(q_ids) <= b["fit_sample_queries"] else np.sort(
             rng.choice(q_ids, size=int(b["fit_sample_queries"]), replace=False))
-        q_chunks = list(chunks(len(q_ids), size))
+        q_chunks = list(chunks(len(q_ids), size))[:max_chunks]
         done_ci = {int(np.searchsorted(q_ids, x)) // size for x in done_q0.get(country, [])}
         if len(done_ci) == len(q_chunks):
             LOG.info("  resume: all %d chunks already written", len(q_chunks))
@@ -336,10 +479,19 @@ def _retrieve(cfg: dict, split: str, target: Path, ranker, resume: bool = False)
         views = CountryViews(cfg, s1["name_concat"].gather(s_ids).to_list(),
                              s1["addr_block"].gather(s_ids).to_list(),
                              q["name_concat"].gather(fit_ids).to_list(),
-                             q["addr_block"].gather(fit_ids).to_list())
+                             q["addr_block"].gather(fit_ids).to_list(),
+                             s1["name_core"].gather(s_ids).to_list() if use_rare else None,
+                             q["name_core"].gather(fit_ids).to_list() if use_rare else None)
         del fit_ids
         LOG.info("  vocab: name %d, addr %d", len(views.name_vec.vocabulary_),
                  len(views.addr_vec.vocabulary_))
+        part, q_group = None, None
+        if use_part:
+            gmap = gmaps.get(country, {})
+            part = Partition(_group_codes(s1["state"].gather(s_ids).to_numpy(), gmap), views)
+            q_group = _group_codes(q["state"].gather(q_ids).to_numpy(), gmap)
+            LOG.info("  partition: %d state groups, %.1f%% of queries search the whole country",
+                     len(part.cols), 100 * float((~np.isin(q_group, list(part.cols))).mean()))
 
         # exact keys
         key_cols = ["idx", "name_sorted", "hn", "street"]
@@ -370,12 +522,16 @@ def _retrieve(cfg: dict, split: str, target: Path, ranker, resume: bool = False)
                     for vi, M in enumerate(Q):
                         sp.save_npz(tmp / f"{ci}_{vi}.npz", M, compressed=False)
                     cache[ci] = tuple(tmp / f"{ci}_{vi}.npz" for vi in range(3))
-                R = _topn(views.S_NA, Q[2].T.tocsr(), k_rev, nt)
-                keep = R.data > 0
-                new = pl.DataFrame({"s": s_ids[R.row[keep]], "q": qc_ids[R.col[keep]],
-                                    "v": R.data[keep]})
+                if part is None:
+                    R = _topn(views.S_NA, Q[2].T.tocsr(), k_rev, nt)
+                    r_s, r_q, r_v = R.row, R.col, R.data
+                else:
+                    r_s, r_q, r_v = part.reverse(Q[2], part.rows_by_group(q_group[a:e]), k_rev, nt)
+                keep = r_v > 0
+                new = pl.DataFrame({"s": s_ids[r_s[keep]], "q": qc_ids[r_q[keep]],
+                                    "v": r_v[keep]})
                 rev = new if rev is None else _top_k_per_s(pl.concat([rev, new]), k_rev)
-                del Q, R, keep, new
+                del Q, keep, new, r_s, r_q, r_v
                 LOG.info("  reverse chunk %d/%d: %d queries | %.1f min", ci + 1, len(q_chunks),
                          len(qc_ids), (time.perf_counter() - t0) / 60)
             rev = _top_k_per_s(rev, k_rev)
@@ -403,7 +559,9 @@ def _retrieve(cfg: dict, split: str, target: Path, ranker, resume: bool = False)
             lo = np.searchsorted(ex_q_all, qc_ids[0], side="left")
             hi = np.searchsorted(ex_q_all, qc_ids[-1], side="right")
             extra = (ex_q_all[lo:hi], ex_s_all[lo:hi], ex_f_all[lo:hi])
-            df = union_features(qc_ids, s_ids, views, Q, extra, s1, q, n_s1_total, cfg)
+            by_group = part.rows_by_group(q_group[a:e]) if part is not None else None
+            df = union_features(qc_ids, s_ids, views, Q, extra, s1, q, n_s1_total, cfg,
+                                part, by_group)
             if q_true is not None:
                 df = df.with_columns(
                     pl.Series("label", (q_true[df["q"].to_numpy()] == df["s"].to_numpy())
@@ -421,12 +579,52 @@ def _retrieve(cfg: dict, split: str, target: Path, ranker, resume: bool = False)
             part_i += 1
             del df, Q, extra
         shutil.rmtree(tmp, ignore_errors=True)
-        del views, ex_q_all, ex_s_all, ex_f_all, cache
+        del views, ex_q_all, ex_s_all, ex_f_all, cache, part
 
 
 # ---------------------------------------------------------------------------------------------
 # diagnostics
 # ---------------------------------------------------------------------------------------------
+
+def run_block_bench(cfg: dict) -> dict:
+    """Retrieval with the current settings (no stage-0 cut) on the first ``bench_chunks`` query
+    chunks of every train country: union recall, union size and time, next to the recall of the
+    cached candidates for the same queries. Only writes work/train/_bench_union + a report."""
+    n = int(cfg["blocking"].get("bench_chunks", 1))
+    out = split_dir(cfg, "train")
+    target = reset_dir(out / "_bench_union")
+    t0 = time.perf_counter()
+    _retrieve(cfg, "train", target, None, max_chunks=n)
+    minutes = (time.perf_counter() - t0) / 60
+    src_cols = ["in_n", "in_a", "in_na", "key_name", "key_addr", "rev"]
+    u = pl.concat([pl.read_parquet(p, columns=["q", "s", "label", "in_rn"] + src_cols)
+                   for p in list_parts(target)], how="vertical")
+    q_true = load_truth(cfg)["q_true"]
+    qs = u["q"].unique().to_numpy()
+    qs = qs[q_true[qs] >= 0]
+    found = np.isin(qs, u.filter(pl.col("label") == 1)["q"].to_numpy())
+    only_rn = u.filter((pl.col("label") == 1) & (pl.col("in_rn") == 1)
+                       & (pl.sum_horizontal(src_cols) == 0)).height
+    old_found = np.zeros(len(qs), dtype=bool)
+    if (out / "cand").exists():
+        for p in list_parts(out / "cand"):
+            c = pl.read_parquet(p, columns=["q", "label"]).filter(pl.col("label") == 1)
+            old_found |= np.isin(qs, c["q"].to_numpy())
+    qc = load_records(cfg, "train", "q", ["country"])["country"].to_numpy()
+    rep = {"minutes_total": round(minutes, 2), "chunks_per_country": n,
+           "union_pairs_per_query": float(u.height / max(u["q"].n_unique(), 1)),
+           "true_pairs_only_via_rare_view": int(only_rn),
+           "note": "reverse search limited to the benched chunks (slightly optimistic)"}
+    for c in sorted(set(qc[qs].tolist())):
+        m = qc[qs] == c
+        rep[c] = {"queries_with_match": int(m.sum()),
+                  "new_union_recall": float(found[m].mean()),
+                  "cached_candidate_recall_M12": float(old_found[m].mean())}
+    save_json(rep, report_dir(cfg) / "blocking_bench.json")
+    LOG.info("block-bench: %s", rep)
+    shutil.rmtree(target, ignore_errors=True)
+    return rep
+
 
 def blocking_report(cfg: dict, split: str) -> dict:
     out = split_dir(cfg, split)

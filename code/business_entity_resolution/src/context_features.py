@@ -89,6 +89,21 @@ def s_level_features(s: np.ndarray, q: np.ndarray, s0: np.ndarray, top1: np.ndar
                                      ).astype(np.float32)
         f["g_hn_b_share"] = np.where(f["g_n"] > 0, f["g_hn_b"] / f["g_n"], np.nan
                                      ).astype(np.float32)
+    # house-number groups of G_s: decoy twins form a second, smaller group sharing a shifted
+    # number, so "is q's number the best-supported one" separates them from the true group
+    grp_n = np.zeros(n_s1, dtype=np.float32)
+    grp_max = np.zeros(n_s1, dtype=np.float32)
+    if len(keys_T):
+        uk, uc = np.unique(keys_T, return_counts=True)
+        us = uk // _HN_SCALE
+        grp_n = np.bincount(us, minlength=n_s1).astype(np.float32)
+        np.maximum.at(grp_max, us, uc.astype(np.float32))
+    f["g_n_hn"] = grp_n[s]
+    f["g_hn_b_is_max"] = np.where(has_q, (cnt_b > 0) & (cnt_b >= grp_max[s]), np.nan
+                                  ).astype(np.float32)
+    f["g_hn_a_is_max"] = np.where(has_a, (cnt_a > 0) & (cnt_a >= grp_max[s]), np.nan
+                                  ).astype(np.float32)
+    f["g_hn_ba_diff"] = (f["g_hn_b"] - f["g_hn_a"]).astype(np.float32)
     return f
 
 

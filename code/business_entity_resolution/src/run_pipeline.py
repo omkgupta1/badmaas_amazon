@@ -6,6 +6,12 @@ Commands (each stage caches its output and is skipped when already done; --force
     prep      --split {train,test}   parse records, mine lexicons
     block     --split {train,test}   candidate generation (+ stage-0 ranker on train);
                                      --resume continues an interrupted run
+    block-bench                      recall + speed of the blocking settings on 1 chunk/country
+    blank --src DIR --country C --out DIR   LB probe: DIR's matches with country C emptied
+    shift                            adversarial validation train vs test slices (read-only)
+    aug-check                        synthetic records vs real: no giveaway in stage-0 columns
+    gates     [--tag B]              offline gates: accepted per S1 by house-number relation, train vs test
+    augment                          synthetic decoy twins in train (after train blocking)
     features  --split {train,test}   pairwise + context features
     train-a                          stage-A models, train OOF predictions
     predict-a --split test           stage-A test predictions
@@ -15,6 +21,7 @@ Commands (each stage caches its output and is skipped when already done; --force
     write                            decide on test, write output/*.tsv, run the validator
     all                              everything above, in order
     report                           rebuild work/reports/summary.md
+    probe     --tag B --out DIR      cached test decision minus the decoy-twin signature -> DIR
     loco                             leave-one-country-out generalisation check
     dev-slice                        build the ~5% dev dataset into work/dev_data
     neural-export / neural-train --half {0,1} / neural-infer   optional cross-encoder
@@ -94,6 +101,9 @@ def run_all(cfg: dict, force: bool) -> None:
         run_prep(cfg, split)
     for split in ("train", "test"):
         run_blocking(cfg, split)
+    from .augment import run_augment
+
+    run_augment(cfg)
     for split in ("train", "test"):
         run_features(cfg, split)
         run_context(cfg, split)
@@ -125,6 +135,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--resume", action="store_true",
                     help="block: keep the chunks an interrupted run already wrote")
+    ap.add_argument("--out", default=None, help="probe: folder for the probe's TSV files")
+    ap.add_argument("--src", default=None, help="blank: submission folder to copy")
+    ap.add_argument("--country", default=None, help="blank: country whose rows are emptied")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config, args.override)
@@ -146,6 +159,34 @@ def main(argv: list[str] | None = None) -> int:
         from .blocking import run_blocking
 
         run_blocking(cfg, need_split(), resume=args.resume)
+    elif cmd == "blank":
+        from pathlib import Path
+
+        from .postprocess import blank_country
+
+        if args.out is None or args.src is None or args.country is None:
+            ap.error("blank needs --src DIR --country NAME --out DIR")
+        blank_country(cfg, Path(args.src), args.country, Path(args.out))
+    elif cmd == "gates":
+        from .diagnose import run_gates
+
+        run_gates(cfg, args.tag)
+    elif cmd == "aug-check":
+        from .diagnose import run_aug_check
+
+        run_aug_check(cfg)
+    elif cmd == "shift":
+        from .diagnose import run_shift
+
+        run_shift(cfg)
+    elif cmd == "block-bench":
+        from .blocking import run_block_bench
+
+        run_block_bench(cfg)
+    elif cmd == "augment":
+        from .augment import run_augment
+
+        run_augment(cfg)
     elif cmd == "features":
         from .context_features import run_context
         from .features import run_features
@@ -178,6 +219,14 @@ def main(argv: list[str] | None = None) -> int:
         from .report import build_summary
 
         build_summary(cfg)
+    elif cmd == "probe":
+        from pathlib import Path
+
+        from .postprocess import run_probe
+
+        if args.out is None:
+            ap.error("probe needs --out <folder> (never output/)")
+        run_probe(cfg, args.tag, Path(args.out))
     elif cmd == "loco":
         from .loco import run_loco
 

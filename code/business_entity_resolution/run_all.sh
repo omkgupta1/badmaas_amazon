@@ -23,6 +23,7 @@ fi
 "${PY[@]}" prep --split test
 "${PY[@]}" block --split train
 "${PY[@]}" block --split test
+"${PY[@]}" augment      # synthetic decoy twins in train (test decoys come as groups)
 "${PY[@]}" features --split train
 "${PY[@]}" features --split test
 "${PY[@]}" train-a

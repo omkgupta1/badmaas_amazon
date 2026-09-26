@@ -19,7 +19,7 @@ from rapidfuzz import fuzz, process
 from rapidfuzz.distance import Hamming, JaroWinkler, Levenshtein, OSA, Postfix, Prefix
 from sklearn.feature_extraction.text import CountVectorizer
 
-from .config import report_dir, split_dir
+from .config import models_dir, report_dir, split_dir
 from .records import load_raw, load_records
 from .utils import LOG, is_done, list_parts, mark_done, part_path, reset_dir, stage, write_df
 
@@ -35,19 +35,54 @@ REC_COLS = ["country"] + NAME_COLS + ADDR_COLS
 # token spaces: IDF-weighted binary bags for set-overlap features
 # ---------------------------------------------------------------------------------------------
 
-class TokenSpace:
-    """Binary bag-of-tokens over S1 + S2/S3 docs with sqrt(IDF) weights (dot = sum of IDF)."""
+IDF_MAX_RATE = 1e-5   # tokens rarer than this share of a country's docs all get the same IDF
 
-    def __init__(self, docs_s1: list[str], docs_q: list[str]):
+
+class TokenSpace:
+    """Binary bag-of-tokens over S1 + S2/S3 docs with sqrt(IDF) weights (dot = sum of IDF).
+
+    IDF is computed per country (pairs never cross countries) and capped for very rare tokens,
+    so a token's weight depends on its share of the country's documents only, and common French
+    words are not treated as rare because they are diluted by US / India documents.
+    ``idf_ref`` (country -> DataFrame[token, idf], saved from train) replaces the IDF of countries
+    seen in train, so test features use exactly the train weights (unseen tokens: the cap);
+    ``keep_idf`` stores the fitted tables in ``self.idf_tables`` for saving.
+    """
+
+    def __init__(self, docs_s1: list[str], docs_q: list[str], country_s1: np.ndarray | None = None,
+                 country_q: np.ndarray | None = None, idf_ref: dict | None = None,
+                 keep_idf: bool = False):
         cv = CountVectorizer(analyzer=str.split, binary=True, dtype=np.float32)
         P = cv.fit_transform(docs_s1 + docs_q).tocsr()
         n_s1 = len(docs_s1)
         self.vocab_size = P.shape[1]
-        dfreq = np.asarray(P.sum(axis=0)).ravel()
-        idf = (np.log((1.0 + P.shape[0]) / (1.0 + dfreq)) + 1.0).astype(np.float32)
+        self.idf_tables: dict[str, pl.DataFrame] = {}
+        vocab = cv.get_feature_names_out() if (idf_ref or keep_idf) else None
+        country = (np.zeros(P.shape[0], dtype=object) if country_s1 is None
+                   else np.concatenate([country_s1, country_q]).astype(object))
+        cap = np.log(1.0 / IDF_MAX_RATE) + 1.0
+        blocks, order = [], []
+        for c in sorted(set(country.tolist())):
+            rows = np.flatnonzero(country == c)
+            Pc = P[rows]
+            dfreq = np.asarray(Pc.sum(axis=0)).ravel()
+            idf = np.minimum(np.log((1.0 + len(rows)) / (1.0 + dfreq)) + 1.0, cap)
+            if idf_ref and c in idf_ref:
+                j = (pl.DataFrame({"token": vocab}).with_row_index("j")
+                     .join(idf_ref[c], on="token", how="inner"))
+                idf = np.full(len(vocab), cap)
+                idf[j["j"].to_numpy()] = j["idf"].to_numpy()
+            elif keep_idf:
+                seen = dfreq > 0
+                self.idf_tables[str(c)] = pl.DataFrame({"token": vocab[seen],
+                                                        "idf": idf[seen].astype(np.float64)})
+            blocks.append((Pc @ sp.diags(np.sqrt(idf).astype(np.float32))).tocsr())
+            order.append(rows)
+        inv = np.empty(P.shape[0], dtype=np.int64)
+        inv[np.concatenate(order)] = np.arange(P.shape[0])
+        W = sp.vstack(blocks, format="csr")[inv].astype(np.float32)
         cnt = np.diff(P.indptr).astype(np.float32)
-        W = (P @ sp.diags(np.sqrt(idf))).tocsr().astype(np.float32)
-        del P
+        del P, blocks
         self.WS, self.WQ = W[:n_s1], W[n_s1:]
         sq = np.asarray(W.multiply(W).sum(axis=1)).ravel().astype(np.float32)
         self.norm_s, self.norm_q = sq[:n_s1], sq[n_s1:]
@@ -102,12 +137,25 @@ def build_spaces(cfg: dict, split: str, s1: pl.DataFrame) -> dict[str, TokenSpac
         "nums": pl.col("nums"),
         "phon": pl.col("name_phon"),
     }
+    q_country = load_records(cfg, split, "q", ["country"])["country"].to_numpy()
+    s_country = load_records(cfg, split, "s1", ["country"])["country"].to_numpy()
     for key, expr in specs.items():
         col = expr.meta.root_names()[0]
         q_docs = load_records(cfg, split, "q", [col]).select(expr.alias("d"))["d"].to_list()
         s_docs = s1.select(expr.alias("d"))["d"].to_list() if col in s1.columns else \
             load_records(cfg, split, "s1", [col]).select(expr.alias("d"))["d"].to_list()
-        spaces[key] = TokenSpace(s_docs, q_docs)
+        path = models_dir(cfg) / f"idf_{key}.parquet"
+        ref = None
+        if split != "train" and path.exists():  # train weights for countries seen in train
+            t = pl.read_parquet(path)
+            ref = {c: t.filter(pl.col("country") == c).select(["token", "idf"])
+                   for c in t["country"].unique().to_list()}
+        spaces[key] = TokenSpace(s_docs, q_docs, s_country, q_country, idf_ref=ref,
+                                 keep_idf=split == "train")
+        if split == "train":
+            write_df(pl.concat([t.with_columns(pl.lit(c).alias("country"))
+                                for c, t in spaces[key].idf_tables.items()], how="vertical"), path)
+            spaces[key].idf_tables = {}
         del q_docs, s_docs
         LOG.info("  token space %s: vocab %d", key, spaces[key].vocab_size)
     return spaces
@@ -402,6 +450,15 @@ def pair_features(cand: pl.DataFrame, s1: pl.DataFrame, qrec: pl.DataFrame, qloc
     return pl.DataFrame(feats)
 
 
+def _id_runs(ids: np.ndarray, gap: int = 1_000_000) -> list[tuple[int, int]]:
+    """(lo, hi) ranges covering ``ids``, split wherever consecutive sorted ids jump by > gap."""
+    u = np.unique(ids)
+    cut = np.flatnonzero(np.diff(u) > gap)
+    starts = np.r_[0, cut + 1]
+    ends = np.r_[cut, len(u) - 1]
+    return [(int(u[a]), int(u[b])) for a, b in zip(starts, ends)]
+
+
 def run_features(cfg: dict, split: str) -> None:
     out = split_dir(cfg, split)
     feat_dir = out / "feat"
@@ -424,8 +481,12 @@ def run_features(cfg: dict, split: str) -> None:
             cand = pl.read_parquet(p, columns=["pair_id", "q", "s"])
             if cand.height == 0:
                 raise ValueError(f"{p} is empty — blocking never writes empty parts")
-            qmin, qmax = int(cand["q"].min()), int(cand["q"].max())
-            qrec = (pl.scan_parquet(q_glob).filter(pl.col("idx").is_between(qmin, qmax))
+            # one idx range per run of query ids (augmented train parts have a second run of
+            # synthetic ids at the end of the id space)
+            rng_filter = pl.lit(False)
+            for lo, hi in _id_runs(cand["q"].to_numpy()):
+                rng_filter = rng_filter | pl.col("idx").is_between(lo, hi)
+            qrec = (pl.scan_parquet(q_glob).filter(rng_filter)
                     .select(["idx"] + REC_COLS).collect().sort("idx"))
             qloc = np.searchsorted(qrec["idx"].to_numpy(), cand["q"].to_numpy())
             feats = pair_features(cand, s1, qrec, qloc, spaces, amb, src, fmt, nt)
